@@ -7,6 +7,8 @@ from openai import OpenAI
 
 st.set_page_config(page_title="Multi-Agent Orchestrator", page_icon="🤖", layout="wide")
 
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
 # ---------- Agents ----------
 AGENTS = {
     "DocEditor": (
@@ -49,14 +51,14 @@ ASSEMBLE_PROMPT = (
 
 
 # ---------- Helpers ----------
-def get_api_key() -> str:
-    key = st.sidebar.text_input("OpenAI API Key", type="password", placeholder="sk-...")
+def get_api_key(label: str, env_name: str) -> str:
+    key = st.sidebar.text_input(label, type="password")
     if key:
         return key.strip()
-    if os.getenv("OPENAI_API_KEY"):
-        return os.environ["OPENAI_API_KEY"]
+    if os.getenv(env_name):
+        return os.environ[env_name]
     try:
-        return st.secrets["OPENAI_API_KEY"]
+        return st.secrets[env_name]
     except Exception:
         return ""
 
@@ -67,8 +69,21 @@ def chat(client, model, system, user, history=None, temperature=0.3, json_mode=F
     messages.append({"role": "user", "content": user})
     kwargs = {"model": model, "messages": messages, "temperature": temperature}
     if json_mode:
-        kwargs["response_format"] = {"type": "json_object"}
+        try:
+            kwargs["response_format"] = {"type": "json_object"}
+            return client.chat.completions.create(**kwargs).choices[0].message.content
+        except Exception:
+            kwargs.pop("response_format", None)  # some providers don't support JSON mode
     return client.chat.completions.create(**kwargs).choices[0].message.content
+
+
+def clean_json(raw: str) -> str:
+    raw = (raw or "").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:]
+    return raw.strip()
 
 
 def recent_history(limit=4, max_chars=1500):
@@ -79,7 +94,7 @@ def recent_history(limit=4, max_chars=1500):
 def route(client, model, prompt, history):
     raw = chat(client, model, ROUTER_PROMPT, prompt, history, temperature=0.1, json_mode=True)
     try:
-        data = json.loads(raw)
+        data = json.loads(clean_json(raw))
         plan = [p for p in data.get("plan", []) if p.get("agent") in AGENTS]
         summary = data.get("summary", prompt[:100])
     except (json.JSONDecodeError, AttributeError):
@@ -93,10 +108,21 @@ def route(client, model, prompt, history):
 st.title("🤖 Multi-Agent Orchestrator")
 st.caption("Master Agent routes your task to DocEditor, WebDesigner and MultiTasker.")
 
-with st.sidebar:
-    st.header("Settings")
-model = st.sidebar.selectbox("Model", ["gpt-4o-mini", "gpt-4o"], help="gpt-4o-mini is much cheaper")
-api_key = get_api_key()
+st.sidebar.header("Settings")
+provider = st.sidebar.selectbox("Provider", ["Gemini (free tier)", "OpenAI"])
+
+if provider == "OpenAI":
+    model = st.sidebar.selectbox("Model", ["gpt-4o-mini", "gpt-4o"], help="gpt-4o-mini is cheaper")
+    api_key = get_api_key("OpenAI API Key", "OPENAI_API_KEY")
+    base_url = None
+else:
+    model = st.sidebar.text_input(
+        "Model", value="gemini-2.5-flash", key="gemini_model",
+        help="If this model name stops working, check aistudio.google.com for the current name.",
+    ).strip()
+    api_key = get_api_key("Gemini API Key", "GEMINI_API_KEY")
+    base_url = GEMINI_BASE_URL
+
 if st.sidebar.button("Clear chat"):
     st.session_state.messages = []
     st.rerun()
@@ -115,10 +141,10 @@ if prompt := st.chat_input("Apna task yahan likhein..."):
 
     with st.chat_message("assistant"):
         if not api_key:
-            st.error("Sidebar mein apni OpenAI API Key paste karein.")
+            st.error("Sidebar mein apni API Key paste karein.")
             st.stop()
 
-        client = OpenAI(api_key=api_key)
+        client = OpenAI(api_key=api_key, base_url=base_url)
         try:
             with st.status("Master Orchestrator coordinating agents...", expanded=True) as status:
                 history = recent_history()
@@ -148,4 +174,7 @@ if prompt := st.chat_input("Apna task yahan likhein..."):
             st.session_state.messages.append({"role": "assistant", "content": final})
         except Exception as e:
             st.error(f"Error: {e}")
-            st.caption("Check API key, internet, and that your OpenAI account has billing/credits.")
+            st.caption(
+                "Check the API key and model name. On Gemini's free tier, a 'rate limit' / 429 "
+                "error means wait a minute and try again."
+            )
